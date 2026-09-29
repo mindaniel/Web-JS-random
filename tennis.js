@@ -297,11 +297,21 @@ window.triggerInstantBooking = async function(index, btnElement) {
 
     const slot1 = window.AVAILABLE_SLOTS[index];
     
-    const slot2 = window.AVAILABLE_SLOTS.find(s => 
-        s.StartTime === slot1.EndTime && 
-        s.LocationCode.trim() === slot1.LocationCode.trim() &&
-        s.ActivityCode === slot1.ActivityCode
-    );
+    // Calculate the duration of the first slot in minutes
+    const st1 = new Date(slot1.StartTime);
+    const et1 = new Date(slot1.EndTime);
+    const duration1Mins = (et1 - st1) / 60000;
+
+    let slot2 = null;
+    
+    // Only attempt to chain a second slot if the first slot is less than 1.5 hours (90 mins)
+    if (duration1Mins < 90) {
+        slot2 = window.AVAILABLE_SLOTS.find(s => 
+            s.StartTime === slot1.EndTime && 
+            s.LocationCode.trim() === slot1.LocationCode.trim() &&
+            s.ActivityCode === slot1.ActivityCode
+        );
+    }
 
     let s1_result = false;
     let s2_result = false;
