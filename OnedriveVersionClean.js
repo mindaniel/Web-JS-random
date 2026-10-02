@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Universal OneDrive Cleaner & Nuker (Personal + Business, Full)
 // @namespace    http://tampermonkey.net/
-// @version      8.4
-// @description  Cleans old file versions and empties recycle bin in OneDrive/SharePoint. Flat-scan via RenderListDataAsStream + client-side Modified sort.
+// @version      8.6
+// @description  Cleans old file versions and empties recycle bin in OneDrive/SharePoint. Streams scan + cleanup page by page.
 // @author       You
 // @match        *://*.sharepoint.com/*
 // @match        *://onedrive.live.com/*
@@ -23,7 +23,11 @@
     const REQUEST_DELAY_MS = 800;
     const MAX_RETRIES = 3;
     const PAGE_SIZE = 2000;
-    const PROGRESS_LOG_EVERY = 25;   // log progress every N files during processing
+    const PROGRESS_LOG_EVERY = 25;
+
+    // 'desc' = newest uploads first (recommended for streaming)
+    // 'asc'  = oldest uploads first
+    const SCAN_SORT_DIRECTION = 'desc';
 
     // --- TOAST CONFIGURATION ---
     const TOAST_DURATION_MS = 2800;
@@ -141,9 +145,9 @@
         } catch (e) { return null; }
     }
 
-    let sessionStats = { recycled: 0, failed: 0, binDeleted: 0, binFailed: 0, scanned: 0 };
+    let sessionStats = { recycled: 0, failed: 0, binDeleted: 0, binFailed: 0, scanned: 0, eligible: 0 };
     function resetSessionStats() {
-        sessionStats = { recycled: 0, failed: 0, binDeleted: 0, binFailed: 0, scanned: 0 };
+        sessionStats = { recycled: 0, failed: 0, binDeleted: 0, binFailed: 0, scanned: 0, eligible: 0 };
     }
 
     // ============================================================
@@ -296,102 +300,12 @@
         }
     }
 
-    // ============================================================
-    // --- FLAT LIBRARY SCAN via RenderListDataAsStream ---
-    // One recursive call per 2,000 items returns files from every
-    // subfolder, with Modified dates. Bypasses the list view
-    // threshold via ID-sorted server-side pagination.
-    // ============================================================
-    async function scanAllFiles(headers) {
-        const listUrl = `${SITE_URL}/Documents`;
-        const baseUrl = `${SITE_URL}/_api/web/GetList(@a1)/RenderListDataAsStream?@a1='${encodeURIComponent(listUrl)}'`;
-
-        const viewXml =
-            `<View Scope='Recursive'>` +
-                `<Query>` +
-                    `<OrderBy><FieldRef Name='ID' Ascending='TRUE' /></OrderBy>` +
-                `</Query>` +
-                `<RowLimit Paged='TRUE'>${PAGE_SIZE}</RowLimit>` +
-            `</View>`;
-
-        const requestBody = {
-            parameters: {
-                "__metadata": { "type": "SP.RenderListDataParameters" },
-                "ViewXml": viewXml,
-                "FolderServerRelativeUrl": STARTING_FOLDER,
-                "RenderOptions": 2,
-                "AllowMultipleValueFilterForTaxonomyFields": true,
-                "AddRequiredFields": true
-            }
-        };
-
-        const allFiles = [];
-        let nextHref = null;
-        let firstPage = true;
-        let pageNum = 0;
-
-        while (firstPage || nextHref) {
-            firstPage = false;
-            pageNum++;
-
-            let url = baseUrl;
-            if (nextHref) {
-                url += '&' + nextHref.replace(/^\?/, '');
-            }
-
-            const response = await fetchWithRetry(url, {
-                method: 'POST',
-                headers,
-                credentials: 'include',
-                body: JSON.stringify(requestBody)
-            });
-
-            if (!response.ok) {
-                console.error(`   ❌ Scan page ${pageNum} failed (status ${response.status})`);
-                break;
-            }
-
-            const data = await response.json();
-            const payload = data.d || data;
-            const rows = payload.Row || [];
-
-            for (const r of rows) {
-                // Only files, skip folders
-                if (String(r.FSObjType) !== "0") continue;
-                if (!r.FileRef || !r.FileLeafRef) continue;
-
-                allFiles.push({
-                    ServerRelativeUrl: r.FileRef,
-                    Name: r.FileLeafRef,
-                    UIVersionLabel: r._UIVersionString || '',
-                    ModifiedRaw: r["Modified."] || r.Modified || ''
-                });
-            }
-
-            nextHref = payload.NextHref || null;
-
-            console.log(`   📄 Page ${pageNum}: ${rows.length} rows (${allFiles.length} files so far)`);
-
-            if (nextHref) {
-                await sleep(REQUEST_DELAY_MS);
-            }
-        }
-
-        console.log(`   ✅ Library scan complete: ${allFiles.length} files total`);
-        return allFiles;
-    }
-
-    // --- Parse SharePoint Modified date to a sortable timestamp ---
-    function parseModifiedDate(file) {
-        // Prefer the ISO form when present
-        const iso = file.ModifiedRaw;
-        if (iso && /^\d{4}-\d{2}-\d{2}T/.test(iso)) {
-            const t = Date.parse(iso);
-            if (!isNaN(t)) return t;
-        }
-        // Fall back to Date parsing for locale string
-        const t2 = Date.parse(iso);
-        return isNaN(t2) ? 0 : t2;
+    // --- Parse SharePoint Modified date to sortable timestamp ---
+    function parseModifiedDate(raw) {
+        if (!raw) return 0;
+        const iso = /^\d{4}-\d{2}-\d{2}T/.test(raw);
+        const t = Date.parse(raw);
+        return isNaN(t) ? 0 : t;
     }
 
     // --- Get versions for a file ---
@@ -434,9 +348,7 @@
     // --- Clean file versions ---
     async function cleanFileVersions(filePath, fileName, headers) {
         const versions = await getFileVersions(filePath, headers);
-        if (versions.length <= VERSIONS_TO_KEEP) {
-            return; // nothing to do — silent
-        }
+        if (versions.length <= VERSIONS_TO_KEEP) return;
 
         const sortedVersions = versions.sort((a, b) => {
             const dateA = a.Created ? new Date(a.Created) : new Date(0);
@@ -474,6 +386,155 @@
         }
     }
 
+    // ============================================================
+    // --- STREAMING SCAN + CLEAN ---
+    // Fetches one page, processes its eligible files, then moves
+    // on to the next page. Nothing waits for the full scan.
+    // ============================================================
+    async function streamScanAndClean(scanHeaders) {
+        const listUrl = `${SITE_URL}/Documents`;
+        const baseUrl = `${SITE_URL}/_api/web/GetList(@a1)/RenderListDataAsStream?@a1='${encodeURIComponent(listUrl)}'`;
+
+        const viewXml =
+            `<View Scope='Recursive'>` +
+                `<ViewFields>` +
+                    `<FieldRef Name='FileLeafRef' />` +
+                    `<FieldRef Name='FileRef' />` +
+                    `<FieldRef Name='Modified' />` +
+                    `<FieldRef Name='_UIVersionString' />` +
+                    `<FieldRef Name='owshiddenversion' />` +
+                `</ViewFields>` +
+                `<Query>` +
+                    `<OrderBy><FieldRef Name='ID' Ascending='${SCAN_SORT_DIRECTION === 'asc' ? 'TRUE' : 'FALSE'}' /></OrderBy>` +
+                `</Query>` +
+                `<RowLimit Paged='TRUE'>${PAGE_SIZE}</RowLimit>` +
+            `</View>`;
+
+        const requestBody = {
+            parameters: {
+                "__metadata": { "type": "SP.RenderListDataParameters" },
+                "ViewXml": viewXml,
+                "FolderServerRelativeUrl": STARTING_FOLDER,
+                "RenderOptions": 2,
+                "AllowMultipleValueFilterForTaxonomyFields": true,
+                "AddRequiredFields": true
+            }
+        };
+
+        const versionHistogram = {};
+        const startTime = Date.now();
+        let nextHref = null;
+        let firstPage = true;
+        let pageNum = 0;
+        let processedFiles = 0;
+        let eligibleTotal = 0;
+
+        while (firstPage || nextHref) {
+            firstPage = false;
+            pageNum++;
+
+            // ---- Fetch one page ----
+            let url = baseUrl;
+            if (nextHref) url += '&' + nextHref.replace(/^\?/, '');
+
+            const response = await fetchWithRetry(url, {
+                method: 'POST',
+                headers: scanHeaders,
+                credentials: 'include',
+                body: JSON.stringify(requestBody)
+            });
+
+            if (!response.ok) {
+                console.error(`   ❌ Page ${pageNum} failed (status ${response.status}) — stopping`);
+                break;
+            }
+
+            const data = await response.json();
+            const payload = data.d || data;
+            const rows = payload.Row || [];
+            nextHref = payload.NextHref || null;
+
+            // ---- Extract files from this page ----
+            const pageFiles = [];
+            for (const r of rows) {
+                if (String(r.FSObjType) !== "0") continue;
+                if (!r.FileRef || !r.FileLeafRef) continue;
+
+                let versionCount = parseInt(r.owshiddenversion, 10);
+                if (isNaN(versionCount) || versionCount < 1) {
+                    const label = parseFloat(r._UIVersionString);
+                    versionCount = isNaN(label) ? 1 : Math.max(1, Math.floor(label));
+                }
+
+                pageFiles.push({
+                    ServerRelativeUrl: r.FileRef,
+                    Name: r.FileLeafRef,
+                    VersionCount: versionCount,
+                    UIVersionLabel: r._UIVersionString || '',
+                    ModifiedRaw: r["Modified."] || r.Modified || ''
+                });
+            }
+
+            sessionStats.scanned += pageFiles.length;
+
+            // ---- Update histogram ----
+            for (const f of pageFiles) {
+                const bucket = f.VersionCount >= 10 ? '10+' : String(f.VersionCount);
+                versionHistogram[bucket] = (versionHistogram[bucket] || 0) + 1;
+            }
+
+            // ---- Filter eligible files for this page ----
+            const eligible = pageFiles.filter(f => {
+                const fileName = f.Name.toLowerCase();
+                if (EXTENSIONS_TO_SKIP.some(ext => fileName.endsWith(ext))) return false;
+                return f.VersionCount > VERSIONS_TO_KEEP;
+            });
+
+            // ---- Sort eligible within this page by Modified desc ----
+            eligible.sort((a, b) => parseModifiedDate(b.ModifiedRaw) - parseModifiedDate(a.ModifiedRaw));
+
+            eligibleTotal += eligible.length;
+            sessionStats.eligible = eligibleTotal;
+
+            console.log(`📄 Page ${pageNum}: ${rows.length} rows | seen ${sessionStats.scanned} | eligible-so-far ${eligibleTotal}${nextHref ? ' | more pages' : ' | last page'}`);
+
+            // ---- Process this page's eligible files ----
+            if (eligible.length > 0) {
+                await processInBatches(eligible, CONCURRENT_REQUESTS, async (file) => {
+                    try {
+                        await cleanFileVersions(file.ServerRelativeUrl, file.Name, await getValidHeaders());
+                    } catch (e) {
+                        console.error(`   ❌ Error on ${file.Name}:`, e);
+                        sessionStats.failed++;
+                    }
+                    processedFiles++;
+                    if (processedFiles % PROGRESS_LOG_EVERY === 0) {
+                        const elapsedMin = (Date.now() - startTime) / 60000;
+                        const ratePerMin = processedFiles / Math.max(elapsedMin, 0.01);
+                        const remainingScanned = sessionStats.scanned - processedFiles;
+                        console.log(`   ⏱️ ${processedFiles} files processed (${elapsedMin.toFixed(1)} min, ${ratePerMin.toFixed(1)} files/min)`);
+                    }
+                });
+            }
+
+            if (nextHref) await sleep(REQUEST_DELAY_MS);
+        }
+
+        // ---- Final histogram ----
+        console.log("\n📊 Version-count distribution (whole library):");
+        Object.keys(versionHistogram).sort((a, b) => {
+            if (a === '10+') return 1;
+            if (b === '10+') return -1;
+            return parseInt(a) - parseInt(b);
+        }).forEach(k => {
+            console.log(`   ${k.padStart(3)} revision(s): ${versionHistogram[k]} files`);
+        });
+
+        const totalMin = (Date.now() - startTime) / 60000;
+        console.log(`\n⏱️ Total runtime: ${totalMin.toFixed(1)} min`);
+        console.log(`📊 Scanned: ${sessionStats.scanned} files | Eligible: ${eligibleTotal} | Processed: ${processedFiles}`);
+    }
+
     // --- Main execution handler ---
     async function startCleanup(btn) {
         try {
@@ -486,57 +547,18 @@
                 ACCOUNT_TYPE = detection.accountType;
             }
 
-            console.log("\n🚀 Starting OneDrive version cleanup...");
+            console.log("\n🚀 Starting OneDrive version cleanup (streaming)...");
             console.log(`📌 Account Type: ${ACCOUNT_TYPE}`);
             console.log(`📌 Personal: ${IS_PERSONAL}`);
             console.log(`📌 Site URL: ${SITE_URL}`);
             console.log(`📌 Library root: ${STARTING_FOLDER}`);
+            console.log(`📌 Keep threshold: ${VERSIONS_TO_KEEP} revisions per file`);
+            console.log(`📌 Scan order: ID ${SCAN_SORT_DIRECTION === 'asc' ? 'ascending (oldest uploads first)' : 'descending (newest uploads first)'}`);
 
-            showToast(`🚀 Scanning library…`, 'info', 3000);
+            showToast(`🚀 Streaming scan + cleanup started…`, 'info', 3000);
 
-            // ---- 1. Flat scan the entire library ----
             const scanHeaders = await getValidHeaders();
-            const allFiles = await scanAllFiles(scanHeaders);
-            sessionStats.scanned = allFiles.length;
-
-            if (allFiles.length === 0) {
-                showToast(`❌ No files found in library`, 'error', 5000);
-                return;
-            }
-
-            showToast(`📦 Found ${allFiles.length} files — sorting by Modified…`, 'info', 3000);
-
-            // ---- 2. Client-side sort by Modified, newest first ----
-            allFiles.sort((a, b) => parseModifiedDate(b) - parseModifiedDate(a));
-            console.log(`📊 Sorted ${allFiles.length} files by Modified (newest first)`);
-
-            // ---- 3. Pre-filter by UIVersionString (skip files with ≤ VERSIONS_TO_KEEP) ----
-            const filesToScan = [];
-            for (const f of allFiles) {
-                const fileName = f.Name.toLowerCase();
-                if (EXTENSIONS_TO_SKIP.some(ext => fileName.endsWith(ext))) continue;
-                const vNum = parseFloat(f.UIVersionLabel);
-                if (!isNaN(vNum) && vNum <= VERSIONS_TO_KEEP) continue;
-                filesToScan.push(f);
-            }
-
-            console.log(`🔥 ${filesToScan.length} files require history cleanup (after version pre-filter)`);
-            showToast(`🔥 Cleaning ${filesToScan.length} files…`, 'info', 3500);
-
-            // ---- 4. Process in order ----
-            let processed = 0;
-            await processInBatches(filesToScan, CONCURRENT_REQUESTS, async (file) => {
-                try {
-                    await cleanFileVersions(file.ServerRelativeUrl, file.Name, await getValidHeaders());
-                } catch (e) {
-                    console.error(`   ❌ Error on ${file.Name}:`, e);
-                    sessionStats.failed++;
-                }
-                processed++;
-                if (processed % PROGRESS_LOG_EVERY === 0) {
-                    console.log(`   ⏱️ Progress: ${processed}/${filesToScan.length} files processed`);
-                }
-            });
+            await streamScanAndClean(scanHeaders);
 
             console.log("\n🎉 Version cleanup complete!");
             showToast(`🎉 Done — ${sessionStats.recycled} recycled${sessionStats.failed ? `, ${sessionStats.failed} failed` : ''}`, sessionStats.failed ? 'warn' : 'success', 5000);
