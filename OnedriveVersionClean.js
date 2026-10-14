@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Universal OneDrive Cleaner & Nuker (Personal + Business, Full)
 // @namespace    http://tampermonkey.net/
-// @version      8.6
-// @description  Cleans old file versions and empties recycle bin in OneDrive/SharePoint. Streams scan + cleanup page by page.
-// @author       You
+// @version      8.7
+// @description  Cleans old file versions and empties recycle bin. Adaptive rate control (AIMD) converges near SharePoint's per-user throttle limit.
+// @author       Me
 // @match        *://*.sharepoint.com/*
 // @match        *://onedrive.live.com/*
 // @match        *://*.onedrive.com/*
@@ -19,8 +19,7 @@
     // --- CONFIGURATION ---
     const VERSIONS_TO_KEEP = 2;
     const EXTENSIONS_TO_SKIP = [];
-    const CONCURRENT_REQUESTS = 1;
-    const REQUEST_DELAY_MS = 800;
+    const CONCURRENT_REQUESTS = 2;
     const MAX_RETRIES = 3;
     const PAGE_SIZE = 2000;
     const PROGRESS_LOG_EVERY = 25;
@@ -28,6 +27,36 @@
     // 'desc' = newest uploads first (recommended for streaming)
     // 'asc'  = oldest uploads first
     const SCAN_SORT_DIRECTION = 'desc';
+
+    // --- ADAPTIVE RATE CONTROL (AIMD) ---
+    // Starts at INITIAL_DELAY. On sustained success, multiplies delay by
+    // SPEED_UP_FACTOR every SPEED_UP_EVERY successes (speeds up). On throttle,
+    // multiplies delay by SLOW_DOWN_FACTOR (slows down). If PANIC_THRESHOLD
+    // throttles happen back-to-back, uses PANIC_FACTOR instead.
+    const RATE = {
+        MIN_DELAY_MS: 300,           // absolute fastest — 200 req/min ceiling
+        MAX_DELAY_MS: 8000,          // slowest — 7.5 req/min floor
+        INITIAL_DELAY_MS: 800,       // starting point
+        SPEED_UP_EVERY: 15,          // successes before each speed-up
+        SPEED_UP_FACTOR: 0.95,       // multiply delay by this to speed up
+        SLOW_DOWN_FACTOR: 1.6,       // multiply delay by this on throttle
+        PANIC_THRESHOLD: 3,          // consecutive throttles before panic mode
+        PANIC_FACTOR: 2.5,           // multiply delay by this in panic mode
+        WINDOW_RATE_MS: 60000,       // rate measurement window
+        WINDOW_THROTTLE_MS: 300000,  // throttle-count window (5 min)
+        REPORT_EVERY_MS: 30000,      // log a rate summary every N ms
+    };
+
+    // Live state
+    let currentDelay = RATE.INITIAL_DELAY_MS;
+    let successStreak = 0;
+    let consecutiveThrottles = 0;
+    let totalRequests = 0;
+    let totalThrottles = 0;
+    let requestTimes = [];
+    let throttleTimes = [];
+    let lastReportTime = 0;
+    let sessionStartTime = 0;
 
     // --- TOAST CONFIGURATION ---
     const TOAST_DURATION_MS = 2800;
@@ -43,6 +72,82 @@
     let tokenFetchTime = 0;
 
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // ============================================================
+    // --- ADAPTIVE RATE CONTROLLER ---
+    // ============================================================
+    function currentRate() {
+        const cutoff = Date.now() - RATE.WINDOW_RATE_MS;
+        requestTimes = requestTimes.filter(t => t > cutoff);
+        return requestTimes.length;
+    }
+
+    function recentThrottleCount() {
+        const cutoff = Date.now() - RATE.WINDOW_THROTTLE_MS;
+        throttleTimes = throttleTimes.filter(t => t > cutoff);
+        return throttleTimes.length;
+    }
+
+    function recordSuccess() {
+        successStreak++;
+        consecutiveThrottles = 0;
+        if (successStreak >= RATE.SPEED_UP_EVERY && currentDelay > RATE.MIN_DELAY_MS) {
+            const before = currentDelay;
+            currentDelay = Math.max(RATE.MIN_DELAY_MS, currentDelay * RATE.SPEED_UP_FACTOR);
+            successStreak = 0;
+            if (before - currentDelay >= 5) {
+                console.log(`⬆️  Speed up → ${Math.round(currentDelay)}ms (~${(60000 / currentDelay).toFixed(0)} req/min)`);
+            }
+        }
+    }
+
+    function recordThrottle() {
+        totalThrottles++;
+        throttleTimes.push(Date.now());
+        successStreak = 0;
+        consecutiveThrottles++;
+
+        const factor = consecutiveThrottles >= RATE.PANIC_THRESHOLD
+            ? RATE.PANIC_FACTOR
+            : RATE.SLOW_DOWN_FACTOR;
+
+        const before = currentDelay;
+        currentDelay = Math.min(RATE.MAX_DELAY_MS, currentDelay * factor);
+
+        if (before !== currentDelay) {
+            const mode = consecutiveThrottles >= RATE.PANIC_THRESHOLD ? 'PANIC' : 'throttle';
+            console.log(`⬇️  Slow down (${mode} x${consecutiveThrottles}) → ${Math.round(currentDelay)}ms (~${(60000 / currentDelay).toFixed(0)} req/min)`);
+        }
+    }
+
+    function maybeReport() {
+        const now = Date.now();
+        if (now - lastReportTime < RATE.REPORT_EVERY_MS) return;
+        lastReportTime = now;
+
+        const rate = currentRate();
+        const throttle5m = recentThrottleCount();
+        const elapsedMin = (now - sessionStartTime) / 60000;
+
+        console.log(
+            `📊 Rate: ${rate} req/min | delay: ${Math.round(currentDelay)}ms | ` +
+            `throttles (5m): ${throttle5m} | total: ${totalRequests} req / ${totalThrottles} throttled | ` +
+            `uptime: ${elapsedMin.toFixed(1)} min`
+        );
+    }
+
+    function rateSummary() {
+        const elapsedMin = (Date.now() - sessionStartTime) / 60000;
+        const avgRate = elapsedMin > 0 ? (totalRequests / elapsedMin).toFixed(1) : '0';
+        return {
+            totalRequests,
+            totalThrottles,
+            finalDelay: Math.round(currentDelay),
+            finalRatePerMin: (60000 / currentDelay).toFixed(0),
+            avgRatePerMin: avgRate,
+            runtimeMin: elapsedMin.toFixed(1),
+        };
+    }
 
     // ============================================================
     // --- DISAPPEARING TOAST / LOG SYSTEM ---
@@ -151,7 +256,9 @@
     }
 
     // ============================================================
-    // --- GLOBAL RATE-LIMIT GATE ---
+    // --- GLOBAL THROTTLE COOLDOWN (separate from adaptive delay) ---
+    // When SharePoint says Retry-After: N, we MUST honor it. This is
+    // in addition to the adaptive delay — a hard pause, not a soft one.
     // ============================================================
     let globalCooldownUntil = 0;
 
@@ -162,8 +269,8 @@
 
     function triggerGlobalCooldown(ms) {
         globalCooldownUntil = Math.max(globalCooldownUntil, Date.now() + ms);
-        console.warn(`🚦 Global cooldown engaged for ${Math.round(ms/1000)}s`);
-        showToast(`🚦 Throttled — pausing all requests ${Math.round(ms/1000)}s…`, 'warn', 2500);
+        console.warn(`🚦 Hard cooldown: ${Math.round(ms / 1000)}s (Retry-After)`);
+        showToast(`🚦 Retry-After ${Math.round(ms / 1000)}s — pausing…`, 'warn', 2500);
     }
 
     // --- Detect account type ---
@@ -244,6 +351,10 @@
 
         if (Date.now() - tokenFetchTime > 20 * 60 * 1000) {
             console.log("🔄 Fetching fresh security token...");
+            // Count this toward rate stats too
+            requestTimes.push(Date.now());
+            totalRequests++;
+
             const digestResponse = await fetch(`${SITE_URL}/_api/contextinfo`, {
                 method: 'POST',
                 headers: { 'Accept': 'application/json;odata=nometadata' },
@@ -257,28 +368,37 @@
         return headers;
     }
 
-    // --- Generic fetch with retry ---
+    // --- Generic fetch with adaptive rate control ---
     async function fetchWithRetry(url, options = {}, retries = MAX_RETRIES) {
         try {
             await waitForCooldown();
-            await sleep(REQUEST_DELAY_MS);
+            await sleep(currentDelay);
+
+            requestTimes.push(Date.now());
+            totalRequests++;
 
             const response = await fetch(url, options);
 
+            // --- Throttle: hard cooldown + adaptive backoff ---
             if (response.status === 429 || response.status === 503) {
+                recordThrottle();
+
                 if (retries > 0) {
                     const retryAfter = response.headers.get('Retry-After');
                     const waitTime = retryAfter
                         ? parseInt(retryAfter) * 1000
                         : 3000 * (MAX_RETRIES - retries + 1);
+
                     triggerGlobalCooldown(waitTime);
                     await sleep(waitTime);
                     return fetchWithRetry(url, options, retries - 1);
                 }
+
                 console.error(`❌ Max retries exceeded (throttled) for ${url}`);
                 return response;
             }
 
+            // --- Other server errors: short retry, no rate change ---
             if (response.status >= 500) {
                 if (retries > 0) {
                     console.warn(`⚠️ Server error (${response.status}), retrying (${retries} left)…`);
@@ -289,6 +409,9 @@
                 return response;
             }
 
+            // --- Success (2xx/3xx/4xx non-throttle) ---
+            recordSuccess();
+            maybeReport();
             return response;
         } catch (error) {
             if (retries > 0) {
@@ -303,7 +426,6 @@
     // --- Parse SharePoint Modified date to sortable timestamp ---
     function parseModifiedDate(raw) {
         if (!raw) return 0;
-        const iso = /^\d{4}-\d{2}-\d{2}T/.test(raw);
         const t = Date.parse(raw);
         return isNaN(t) ? 0 : t;
     }
@@ -371,25 +493,20 @@
                 sessionStats.failed++;
                 showToast(`⚠️ Failed v${label} — ${shortenName(fileName)}`, 'error');
             }
-            await sleep(REQUEST_DELAY_MS);
+            // No extra sleep — fetchWithRetry's adaptive delay is the only throttle
         }
     }
 
-    // --- Process in batches ---
+    // --- Process in batches (no extra sleep, adaptive delay handles pacing) ---
     async function processInBatches(items, batchSize, processFn) {
         for (let i = 0; i < items.length; i += batchSize) {
             const batch = items.slice(i, i + batchSize);
             await Promise.all(batch.map(item => processFn(item)));
-            if (i + batchSize < items.length) {
-                await sleep(REQUEST_DELAY_MS * 2);
-            }
         }
     }
 
     // ============================================================
     // --- STREAMING SCAN + CLEAN ---
-    // Fetches one page, processes its eligible files, then moves
-    // on to the next page. Nothing waits for the full scan.
     // ============================================================
     async function streamScanAndClean(scanHeaders) {
         const listUrl = `${SITE_URL}/Documents`;
@@ -422,7 +539,7 @@
         };
 
         const versionHistogram = {};
-        const startTime = Date.now();
+        const pendingDeletes = [];
         let nextHref = null;
         let firstPage = true;
         let pageNum = 0;
@@ -433,7 +550,6 @@
             firstPage = false;
             pageNum++;
 
-            // ---- Fetch one page ----
             let url = baseUrl;
             if (nextHref) url += '&' + nextHref.replace(/^\?/, '');
 
@@ -454,7 +570,6 @@
             const rows = payload.Row || [];
             nextHref = payload.NextHref || null;
 
-            // ---- Extract files from this page ----
             const pageFiles = [];
             for (const r of rows) {
                 if (String(r.FSObjType) !== "0") continue;
@@ -477,20 +592,17 @@
 
             sessionStats.scanned += pageFiles.length;
 
-            // ---- Update histogram ----
             for (const f of pageFiles) {
                 const bucket = f.VersionCount >= 10 ? '10+' : String(f.VersionCount);
                 versionHistogram[bucket] = (versionHistogram[bucket] || 0) + 1;
             }
 
-            // ---- Filter eligible files for this page ----
             const eligible = pageFiles.filter(f => {
                 const fileName = f.Name.toLowerCase();
                 if (EXTENSIONS_TO_SKIP.some(ext => fileName.endsWith(ext))) return false;
                 return f.VersionCount > VERSIONS_TO_KEEP;
             });
 
-            // ---- Sort eligible within this page by Modified desc ----
             eligible.sort((a, b) => parseModifiedDate(b.ModifiedRaw) - parseModifiedDate(a.ModifiedRaw));
 
             eligibleTotal += eligible.length;
@@ -498,9 +610,9 @@
 
             console.log(`📄 Page ${pageNum}: ${rows.length} rows | seen ${sessionStats.scanned} | eligible-so-far ${eligibleTotal}${nextHref ? ' | more pages' : ' | last page'}`);
 
-            // ---- Process this page's eligible files ----
             if (eligible.length > 0) {
-                await processInBatches(eligible, CONCURRENT_REQUESTS, async (file) => {
+                // Fire deletions in the background so scanning and deleting run simultaneously.
+                pendingDeletes.push(processInBatches(eligible, CONCURRENT_REQUESTS, async (file) => {
                     try {
                         await cleanFileVersions(file.ServerRelativeUrl, file.Name, await getValidHeaders());
                     } catch (e) {
@@ -509,18 +621,18 @@
                     }
                     processedFiles++;
                     if (processedFiles % PROGRESS_LOG_EVERY === 0) {
-                        const elapsedMin = (Date.now() - startTime) / 60000;
+                        const elapsedMin = (Date.now() - sessionStartTime) / 60000;
                         const ratePerMin = processedFiles / Math.max(elapsedMin, 0.01);
-                        const remainingScanned = sessionStats.scanned - processedFiles;
-                        console.log(`   ⏱️ ${processedFiles} files processed (${elapsedMin.toFixed(1)} min, ${ratePerMin.toFixed(1)} files/min)`);
+                        console.log(`   ⏱️ ${processedFiles} files processed | ${ratePerMin.toFixed(1)} files/min | delay ${Math.round(currentDelay)}ms`);
                     }
-                });
+                }));
             }
-
-            if (nextHref) await sleep(REQUEST_DELAY_MS);
+            // No extra sleep — next page fetch already paced by adaptive delay
         }
 
-        // ---- Final histogram ----
+        // Wait for all background deletions to finish before reporting.
+        await Promise.all(pendingDeletes);
+
         console.log("\n📊 Version-count distribution (whole library):");
         Object.keys(versionHistogram).sort((a, b) => {
             if (a === '10+') return 1;
@@ -530,8 +642,6 @@
             console.log(`   ${k.padStart(3)} revision(s): ${versionHistogram[k]} files`);
         });
 
-        const totalMin = (Date.now() - startTime) / 60000;
-        console.log(`\n⏱️ Total runtime: ${totalMin.toFixed(1)} min`);
         console.log(`📊 Scanned: ${sessionStats.scanned} files | Eligible: ${eligibleTotal} | Processed: ${processedFiles}`);
     }
 
@@ -539,6 +649,15 @@
     async function startCleanup(btn) {
         try {
             resetSessionStats();
+            sessionStartTime = Date.now();
+            currentDelay = RATE.INITIAL_DELAY_MS;
+            successStreak = 0;
+            consecutiveThrottles = 0;
+            totalRequests = 0;
+            totalThrottles = 0;
+            requestTimes = [];
+            throttleTimes = [];
+            lastReportTime = 0;
 
             if (!SITE_URL) {
                 const detection = detectSiteAndFolder();
@@ -547,21 +666,31 @@
                 ACCOUNT_TYPE = detection.accountType;
             }
 
-            console.log("\n🚀 Starting OneDrive version cleanup (streaming)...");
+            console.log("\n🚀 Starting OneDrive version cleanup (adaptive rate)...");
             console.log(`📌 Account Type: ${ACCOUNT_TYPE}`);
             console.log(`📌 Personal: ${IS_PERSONAL}`);
             console.log(`📌 Site URL: ${SITE_URL}`);
             console.log(`📌 Library root: ${STARTING_FOLDER}`);
             console.log(`📌 Keep threshold: ${VERSIONS_TO_KEEP} revisions per file`);
-            console.log(`📌 Scan order: ID ${SCAN_SORT_DIRECTION === 'asc' ? 'ascending (oldest uploads first)' : 'descending (newest uploads first)'}`);
+            console.log(`📌 Scan order: ID ${SCAN_SORT_DIRECTION === 'asc' ? 'ascending' : 'descending'}`);
+            console.log(`📌 Rate control: start ${RATE.INITIAL_DELAY_MS}ms, range [${RATE.MIN_DELAY_MS}ms, ${RATE.MAX_DELAY_MS}ms]`);
 
-            showToast(`🚀 Streaming scan + cleanup started…`, 'info', 3000);
+            showToast(`🚀 Streaming scan + adaptive cleanup started…`, 'info', 3000);
 
             const scanHeaders = await getValidHeaders();
             await streamScanAndClean(scanHeaders);
 
+            const s = rateSummary();
             console.log("\n🎉 Version cleanup complete!");
-            showToast(`🎉 Done — ${sessionStats.recycled} recycled${sessionStats.failed ? `, ${sessionStats.failed} failed` : ''}`, sessionStats.failed ? 'warn' : 'success', 5000);
+            console.log(`📈 Rate summary — avg ${s.avgRatePerMin} req/min over ${s.runtimeMin} min`);
+            console.log(`📈 Final delay: ${s.finalDelay}ms (~${s.finalRatePerMin} req/min) | ${s.totalThrottles} throttle events total`);
+
+            showToast(
+                `🎉 Done — ${sessionStats.recycled} recycled${sessionStats.failed ? `, ${sessionStats.failed} failed` : ''} | ` +
+                `avg ${s.avgRatePerMin} req/min`,
+                sessionStats.failed ? 'warn' : 'success',
+                6000
+            );
         } catch (error) {
             console.error("❌ Error during cleanup:", error);
             showToast(`❌ Cleanup failed: ${shortenName(error && error.message, 60)}`, 'error', 5000);
@@ -579,6 +708,7 @@
     async function nukeRecycleBin(btn) {
         try {
             resetSessionStats();
+            sessionStartTime = Date.now();
 
             if (!SITE_URL) {
                 const detection = detectSiteAndFolder();
@@ -726,6 +856,21 @@
         }
     }
 
+    // --- Combined: clean versions, then empty the recycle bin ---
+    async function runCleanupAndNuke(btn) {
+        try {
+            await startCleanup(null);
+            await nukeRecycleBin(null);
+        } finally {
+            if (btn) {
+                btn.innerHTML = '🧹 Clean & Empty Bin';
+                btn.disabled = false;
+                btn.style.backgroundColor = '#0078d4';
+                btn.style.cursor = 'pointer';
+            }
+        }
+    }
+
     // --- UI INJECTION ---
     function createUI() {
         if (document.getElementById('onedrive-tools-panel')) return;
@@ -752,35 +897,20 @@
             font-weight: bold;
             transition: opacity 0.2s;
         `;
-
-        const cleanBtn = document.createElement('button');
-        cleanBtn.innerHTML = '🧹 Clean Versions';
-        cleanBtn.style.cssText = getBtnStyle('#0078d4');
-        cleanBtn.onmouseenter = () => cleanBtn.style.opacity = '0.8';
-        cleanBtn.onmouseleave = () => cleanBtn.style.opacity = '1';
-        cleanBtn.onclick = async () => {
-            cleanBtn.innerHTML = '⏳ Cleaning...';
-            cleanBtn.disabled = true;
-            cleanBtn.style.backgroundColor = '#666666';
-            cleanBtn.style.cursor = 'not-allowed';
-            await startCleanup(cleanBtn);
+        const actionBtn = document.createElement('button');
+        actionBtn.innerHTML = '🧹 Clean & Empty Bin';
+        actionBtn.style.cssText = getBtnStyle('#0078d4');
+        actionBtn.onmouseenter = () => actionBtn.style.opacity = '0.8';
+        actionBtn.onmouseleave = () => actionBtn.style.opacity = '1';
+        actionBtn.onclick = async () => {
+            actionBtn.innerHTML = '⏳ Working...';
+            actionBtn.disabled = true;
+            actionBtn.style.backgroundColor = '#666666';
+            actionBtn.style.cursor = 'not-allowed';
+            await runCleanupAndNuke(actionBtn);
         };
 
-        const nukeBtn = document.createElement('button');
-        nukeBtn.innerHTML = '🗑️ Empty Recycle Bin';
-        nukeBtn.style.cssText = getBtnStyle('#d13438');
-        nukeBtn.onmouseenter = () => nukeBtn.style.opacity = '0.8';
-        nukeBtn.onmouseleave = () => nukeBtn.style.opacity = '1';
-        nukeBtn.onclick = async () => {
-            nukeBtn.innerHTML = '⏳ Nuking...';
-            nukeBtn.disabled = true;
-            nukeBtn.style.backgroundColor = '#666666';
-            nukeBtn.style.cursor = 'not-allowed';
-            await nukeRecycleBin(nukeBtn);
-        };
-
-        panel.appendChild(cleanBtn);
-        panel.appendChild(nukeBtn);
+        panel.appendChild(actionBtn);
         document.body.appendChild(panel);
     }
 
@@ -791,7 +921,6 @@
     }
 
     if (typeof GM_registerMenuCommand !== 'undefined') {
-        GM_registerMenuCommand("Start Version Cleanup", () => startCleanup(null));
-        GM_registerMenuCommand("Empty Recycle Bin (Nuke)", () => nukeRecycleBin(null));
+        GM_registerMenuCommand("Clean & Empty Bin", () => runCleanupAndNuke(null));
     }
 })();
